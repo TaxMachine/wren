@@ -156,8 +156,11 @@ struct sObjString
   // Number of bytes in the string, not including the null terminator.
   uint32_t length;
 
-  // The hash value of the string's contents.
+  // The hash value of the string's contents. Computed lazily on first use
+  // (map lookup, equality fast-path); see wrenStringHash(). [hashed] tracks
+  // whether [hash] is valid since FNV-1a can legitimately produce 0.
   uint32_t hash;
+  bool hashed;
 
   // Inline array of the string's bytes followed by a null terminator.
   char value[FLEXIBLE_ARRAY];
@@ -759,6 +762,10 @@ Value wrenStringCodePointAt(WrenVM* vm, ObjString* string, uint32_t index);
 // [needle].
 uint32_t wrenStringFind(ObjString* haystack, ObjString* needle,
                         uint32_t startIndex);
+
+// Returns the FNV-1a hash of [string]'s contents, computing and caching it
+// on first call. All hash reads must go through here; [hash] is 0 until set.
+uint32_t wrenStringHash(ObjString* string);
 
 // Returns true if [a] and [b] represent the same string.
 static inline bool wrenStringEqualsCString(const ObjString* a,

@@ -417,7 +417,7 @@ static uint32_t hashObject(Obj* object)
     }
 
     case OBJ_STRING:
-      return ((ObjString*)object)->hash;
+      return wrenStringHash((ObjString*)object);
 
     default:
       ASSERT(false, "Only immutable objects can be hashed.");
@@ -463,8 +463,9 @@ static bool findEntry(MapEntry* entries, uint32_t capacity, Value key,
   if (capacity == 0) return false;
   
   // Figure out where to insert it in the table. Use open addressing and
-  // basic linear probing.
-  uint32_t startIndex = hashValue(key) % capacity;
+  // basic linear probing. Capacity is always 0 (handled above) or a power of
+  // two (MIN_CAPACITY scaled by GROW_FACTOR), so mask instead of modulo.
+  uint32_t startIndex = hashValue(key) & (capacity - 1);
   uint32_t index = startIndex;
   
   // If we pass a tombstone and don't end up finding the key, its entry will
@@ -505,7 +506,7 @@ static bool findEntry(MapEntry* entries, uint32_t capacity, Value key,
     }
     
     // Try the next slot.
-    index = (index + 1) % capacity;
+    index = (index + 1) & (capacity - 1);
   }
   while (index != startIndex);
   
@@ -681,27 +682,34 @@ static ObjString* allocateString(WrenVM* vm, size_t length)
   ObjString* string = ALLOCATE_FLEX(vm, ObjString, char, length + 1);
   initObj(vm, &string->obj, OBJ_STRING, vm->stringClass);
   string->length = (int)length;
+  string->hash = 0;
+  string->hashed = false;
   string->value[length] = '\0';
 
   return string;
 }
 
-// Calculates and stores the hash code for [string].
-static void hashString(ObjString* string)
+// Computes the FNV-1a hash of [string]'s contents on first call and caches
+// it. Hashing is O(n) like creation, but most transient strings (join/concat
+// intermediates) are never hashed at all, so this is deferred (wren#1212).
+uint32_t wrenStringHash(ObjString* string)
 {
-  // FNV-1a hash. See: http://www.isthe.com/chongo/tech/comp/fnv/
-  uint32_t hash = 2166136261u;
-
-  // This is O(n) on the length of the string, but we only call this when a new
-  // string is created. Since the creation is also O(n) (to copy/initialize all
-  // the bytes), we allow this here.
-  for (uint32_t i = 0; i < string->length; i++)
+  if (!string->hashed)
   {
-    hash ^= string->value[i];
-    hash *= 16777619;
+    // FNV-1a hash. See: http://www.isthe.com/chongo/tech/comp/fnv/
+    uint32_t hash = 2166136261u;
+
+    for (uint32_t i = 0; i < string->length; i++)
+    {
+      hash ^= string->value[i];
+      hash *= 16777619;
+    }
+
+    string->hash = hash;
+    string->hashed = true;
   }
 
-  string->hash = hash;
+  return string->hash;
 }
 
 Value wrenNewString(WrenVM* vm, const char* text)
@@ -719,8 +727,7 @@ Value wrenNewStringLength(WrenVM* vm, const char* text, size_t length)
   
   // Copy the string (if given one).
   if (length > 0 && text != NULL) memcpy(string->value, text, length);
-  
-  hashString(string);
+
   return OBJ_VAL(string);
 }
 
@@ -750,7 +757,6 @@ Value wrenNewStringFromRange(WrenVM* vm, ObjString* source, int start,
     }
   }
 
-  hashString(result);
   return OBJ_VAL(result);
 }
 
@@ -788,8 +794,22 @@ Value wrenNumToString(WrenVM* vm, double value)
   // + 4 chars for exponent
   // + 1 char for "\0"
   // = 24
+  // Fast path for integral values in int32 range: integer formatting is
+  // much cheaper than "%.14g" and produces identical output here (every
+  // int32 is exactly representable; nonzero excludes -0.0, whose "%.14g"
+  // spelling is "-0", not "0").
+  if (value != 0.0 && value == trunc(value) &&
+      value >= -2147483648.0 && value <= 2147483647.0)
+  {
+    char intBuffer[12];
+    int intLength = snprintf(intBuffer, sizeof(intBuffer), "%d", (int)value);
+    if (intLength < 0) intLength = 0;
+    return wrenNewStringLength(vm, intBuffer, intLength);
+  }
+
   char buffer[24];
-  int length = sprintf(buffer, "%.14g", value);
+  int length = snprintf(buffer, sizeof(buffer), "%.14g", value);
+  if (length < 0) length = 0;
   return wrenNewStringLength(vm, buffer, length);
 }
 
@@ -801,7 +821,6 @@ Value wrenStringFromCodePoint(WrenVM* vm, int value)
   ObjString* string = allocateString(vm, length);
 
   wrenUtf8Encode(value, (uint8_t*)string->value);
-  hashString(string);
 
   return OBJ_VAL(string);
 }
@@ -811,7 +830,6 @@ Value wrenStringFromByte(WrenVM *vm, uint8_t value)
   int length = 1;
   ObjString* string = allocateString(vm, length);
   string->value[0] = value;
-  hashString(string);
   return OBJ_VAL(string);
 }
 
@@ -875,8 +893,6 @@ Value wrenStringFormat(WrenVM* vm, const char* format, ...)
   }
   va_end(argList);
 
-  hashString(result);
-
   return OBJ_VAL(result);
 }
 
@@ -914,13 +930,13 @@ uint32_t wrenStringFind(ObjString* haystack, ObjString* needle, uint32_t start)
   // determine how far the search window can be advanced if that character is
   // the last character in the haystack where we are searching for the needle
   // and the needle doesn't match there.
-  uint32_t shift[UINT8_MAX];
+  uint32_t shift[UINT8_MAX + 1];
   uint32_t needleEnd = needle->length - 1;
 
   // By default, we assume the character is not the needle at all. In that case
   // case, if a match fails on that character, we can advance one whole needle
   // width since.
-  for (uint32_t index = 0; index < UINT8_MAX; index++)
+  for (uint32_t index = 0; index <= UINT8_MAX; index++)
   {
     shift[index] = needle->length;
   }
@@ -1321,8 +1337,16 @@ bool wrenValuesEqual(Value a, Value b)
     {
       ObjString* aString = (ObjString*)aObj;
       ObjString* bString = (ObjString*)bObj;
-      return aString->hash == bString->hash &&
-      wrenStringEqualsCString(aString, bString->value, bString->length);
+      // Length first so unequal lengths stay O(1) without hashing either.
+      if (aString->length != bString->length) return false;
+      // Only use the hashes as an O(1) early-out when both are already known.
+      // Hashing an unhashed string here costs a full O(n) pass before the
+      // memcmp that must run anyway.
+      if (aString->hashed && bString->hashed && aString->hash != bString->hash)
+      {
+        return false;
+      }
+      return wrenStringEqualsCString(aString, bString->value, bString->length);
     }
 
     default:

@@ -617,6 +617,7 @@ DEF_PRIMITIVE(num_fromString)
   errno = 0;
   char* end;
   double number = strtod(string->value, &end);
+  if (end == string->value) RETURN_NULL;
 
   // Skip past any trailing whitespace.
   while (*end != '\0' && isspace((unsigned char)*end)) end++;
@@ -669,17 +670,37 @@ DEF_NUM_INFIX(gte,      >=, BOOL)
 #define DEF_NUM_BITWISE(name, op)                                              \
     DEF_PRIMITIVE(num_bitwise##name)                                           \
     {                                                                          \
-      if (!validateNum(vm, args[1], "Right operand")) return false;            \
+      if (!validateInt(vm, args[0], "Left operand") ||                         \
+          !validateInt(vm, args[1], "Right operand")) return false;            \
       uint32_t left = (uint32_t)AS_NUM(args[0]);                               \
       uint32_t right = (uint32_t)AS_NUM(args[1]);                              \
       RETURN_NUM(left op right);                                               \
     }
 
+#define DEF_NUM_BITWISE_FN(name, fn)                                           \
+    DEF_PRIMITIVE(num_bitwise##name)                                           \
+    {                                                                          \
+      if (!validateInt(vm, args[0], "Left operand") ||                         \
+          !validateInt(vm, args[1], "Right operand")) return false;            \
+      uint32_t left = (uint32_t)AS_NUM(args[0]);                               \
+      uint32_t right = (uint32_t)AS_NUM(args[1]);                              \
+      RETURN_NUM(fn(left, right));                                             \
+    }
+
 DEF_NUM_BITWISE(And,        &)
 DEF_NUM_BITWISE(Or,         |)
 DEF_NUM_BITWISE(Xor,        ^)
-DEF_NUM_BITWISE(LeftShift,  <<)
-DEF_NUM_BITWISE(RightShift, >>)
+DEF_NUM_BITWISE_FN(LeftShift,  wrenBitwiseLeftShift_u32)
+DEF_NUM_BITWISE_FN(RightShift, wrenBitwiseRightShift_u32)
+
+DEF_PRIMITIVE(num_bitwiseShift)
+{
+  if (!validateInt(vm, args[0], "Left operand") ||
+      !validateInt(vm, args[1], "Right operand")) return false;
+  uint32_t left = (uint32_t)AS_NUM(args[0]);
+  int32_t right = (int32_t)AS_NUM(args[1]);
+  RETURN_NUM(wrenBitwiseShift_u32(left, right));
+}
 
 // Defines a primitive method on Num that returns the result of [fn].
 #define DEF_NUM_FN(name, fn)                                                   \
@@ -895,6 +916,32 @@ DEF_PRIMITIVE(object_toString)
 DEF_PRIMITIVE(object_type)
 {
   RETURN_OBJ(wrenGetClass(vm, args[0]));
+}
+
+DEF_PRIMITIVE(range_contains)
+{
+  ObjRange* range = AS_RANGE(args[0]);
+
+  if (!validateNum(vm, args[1], "Element")) return false;
+  double num = AS_NUM(args[1]);
+
+  // If the value isn't an int we know that the value
+  // can't have been produced by the range
+  // NOTE: here we don't want to use the validate function
+  // because it shouldn't be an error
+  if (trunc(num) != num) RETURN_FALSE;
+
+  // If it's an empty range it can't contain any value
+  if (range->from == range->to && !range->isInclusive) RETURN_FALSE;
+  // Handle the inclusive case
+  if (range->isInclusive && num == range->to) RETURN_TRUE;
+  // We can bail early here so we don't need to calculate min or max
+  if (num == range->from) RETURN_TRUE;
+
+  double min = fmin(range->from, range->to);
+  double max = fmax(range->from, range->to);
+
+  RETURN_BOOL(num > min && num < max);
 }
 
 DEF_PRIMITIVE(range_from)
@@ -1218,6 +1265,21 @@ DEF_PRIMITIVE(system_writeString)
   RETURN_VAL(args[1]);
 }
 
+// Cycle/depth guard for printing (wren-lang/wren#1056): List/Map toString
+// recurse through Sequence.join/string interpolation with no cycle detection,
+// so a self-referential value recurses until the fiber exhausts memory. A
+// per-print visited set can't thread through the fixed `toString` signature,
+// and Wren-level statics would leak across Fiber.abort, so bound it with the
+// live call-frame count, which unwinds naturally on return or error. Normal
+// prints sit a handful of frames deep and never trip this.
+#define MAX_PRINT_FRAMES 2048
+
+DEF_PRIMITIVE(system_printTooDeep)
+{
+  ObjFiber* fiber = vm->fiber;
+  RETURN_BOOL(fiber != NULL && fiber->numFrames > MAX_PRINT_FRAMES);
+}
+
 // Creates either the Object or Class class in the core module with [name].
 static ObjClass* defineClass(WrenVM* vm, ObjModule* module, const char* name)
 {
@@ -1371,6 +1433,7 @@ void wrenInitializeCore(WrenVM* vm)
   PRIMITIVE(vm->numClass, "^(_)", num_bitwiseXor);
   PRIMITIVE(vm->numClass, "<<(_)", num_bitwiseLeftShift);
   PRIMITIVE(vm->numClass, ">>(_)", num_bitwiseRightShift);
+  PRIMITIVE(vm->numClass, "bitwiseShift(_)", num_bitwiseShift);
   PRIMITIVE(vm->numClass, "abs", num_abs);
   PRIMITIVE(vm->numClass, "acos", num_acos);
   PRIMITIVE(vm->numClass, "asin", num_asin);
@@ -1458,6 +1521,7 @@ void wrenInitializeCore(WrenVM* vm)
   PRIMITIVE(vm->mapClass, "valueIteratorValue_(_)", map_valueIteratorValue);
 
   vm->rangeClass = AS_CLASS(wrenFindVariable(vm, coreModule, "Range"));
+  PRIMITIVE(vm->rangeClass, "contains(_)", range_contains);
   PRIMITIVE(vm->rangeClass, "from", range_from);
   PRIMITIVE(vm->rangeClass, "to", range_to);
   PRIMITIVE(vm->rangeClass, "min", range_min);
@@ -1471,6 +1535,7 @@ void wrenInitializeCore(WrenVM* vm)
   PRIMITIVE(systemClass->obj.classObj, "clock", system_clock);
   PRIMITIVE(systemClass->obj.classObj, "gc()", system_gc);
   PRIMITIVE(systemClass->obj.classObj, "writeString_(_)", system_writeString);
+  PRIMITIVE(systemClass->obj.classObj, "printTooDeep_", system_printTooDeep);
 
   // While bootstrapping the core types and running the core module, a number
   // of string objects have been created, many of which were instantiated

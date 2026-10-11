@@ -412,6 +412,8 @@ static void runtimeError(WrenVM* vm)
     // Every fiber along the call chain gets aborted with the same error.
     current->error = error;
 
+    closeUpvalues(current, current->stack);
+
     // If the caller ran this fiber using "try", give it the error and stop.
     if (current->state == FIBER_TRY)
     {
@@ -664,16 +666,33 @@ static void createForeign(WrenVM* vm, ObjFiber* fiber, Value* stack)
   int symbol = wrenSymbolTableFind(&vm->methodNames, "<allocate>", 10);
   ASSERT(symbol != -1, "Should have defined <allocate> symbol.");
 
-  ASSERT(classObj->methods.count > symbol, "Class should have allocator.");
+  // The host never bound an allocator for this class (upstream
+  // wren-lang/wren#811): report a runtime error instead of dereferencing a
+  // missing/NULL allocator (segfault in release, assert in debug).
+  if (symbol == -1 || symbol >= classObj->methods.count ||
+      classObj->methods.data[symbol].type != METHOD_FOREIGN ||
+      classObj->methods.data[symbol].as.foreign == NULL)
+  {
+    fiber->error = wrenStringFormat(vm,
+        "Could not find foreign class allocator for class '@'.",
+        OBJ_VAL(classObj->name));
+    return;
+  }
   Method* method = &classObj->methods.data[symbol];
-  ASSERT(method->type == METHOD_FOREIGN, "Allocator should be foreign.");
 
   // Pass the constructor arguments to the allocator as well.
   ASSERT(vm->apiStack == NULL, "Cannot already be in foreign call.");
   vm->apiStack = stack;
+  // Slots live for the pending initializer CALL below (FOREIGN_CONSTRUCT is
+  // always followed by CALL). Save the depth so an allocator that calls
+  // wrenEnsureSlots() (upstream wren-lang/wren#676) cannot leave stackTop
+  // extended and corrupt that CALL's args window. vm->apiStack is fixed up
+  // in place by wrenEnsureStack on a move, so re-derive from it.
+  int numSlots = (int)(fiber->stackTop - stack);
 
   method->as.foreign(vm);
 
+  fiber->stackTop = vm->apiStack + numSlots;
   vm->apiStack = NULL;
 }
 
@@ -739,8 +758,7 @@ static Value importModule(WrenVM* vm, Value name)
   wrenPushRoot(vm, AS_OBJ(name));
 
   WrenLoadModuleResult result = {0};
-  const char* source = NULL;
-  
+
   // Let the host try to provide the module.
   if (vm->config.loadModuleFn != NULL)
   {
@@ -751,7 +769,9 @@ static Value importModule(WrenVM* vm, Value name)
   if (result.source == NULL)
   {
     result.onComplete = NULL;
+#if WREN_OPT_META || WREN_OPT_RANDOM
     ObjString* nameString = AS_STRING(name);
+#endif
 #if WREN_OPT_META
     if (strcmp(nameString->value, "meta") == 0) result.source = wrenMetaSource();
 #endif
@@ -1074,7 +1094,21 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
           break;
 
         case METHOD_FOREIGN:
-          callForeign(vm, fiber, method->as.foreign, numArgs);
+          {
+            Value* oldStack = fiber->stack;
+            callForeign(vm, fiber, method->as.foreign, numArgs);
+
+            // A foreign function may call wrenEnsureSlots, which calls
+            // wrenEnsureStack and reallocates the stack, and so may change its
+            // base address.
+            // This means that stackStart has to be updated to the value rebased
+            // by wrenEnsureSlots and that args has to be updated as well.
+            if (fiber->stack != oldStack)
+            {
+              stackStart = frame->stackStart;
+              args = fiber->stackTop - numArgs;
+            }
+          }
           if (wrenHasError(fiber)) RUNTIME_ERROR();
           break;
 
@@ -1414,6 +1448,11 @@ WrenHandle* wrenMakeCallHandle(WrenVM* vm, const char* signature)
       if (signature[i] == '_') numParams++;
     }
   }
+
+  // The stub below encodes the arity in the opcode, which only ranges up to
+  // MAX_PARAMETERS. Clamp an over-long (host-provided) signature instead of
+  // emitting an out-of-range opcode past CODE_CALL_16.
+  if (numParams > MAX_PARAMETERS) numParams = MAX_PARAMETERS;
   
   // Add the signatue to the method table.
   int method =  wrenSymbolTableEnsure(vm, &vm->methodNames,

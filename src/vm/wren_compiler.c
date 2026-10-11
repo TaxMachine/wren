@@ -43,6 +43,14 @@
 //      "outside %(one + "%(two + "%(three)")")"
 #define MAX_INTERPOLATION_NESTING 8
 
+// The maximum depth of nested definitions and expressions the compiler will
+// accept. The parser is recursive descent, so hostile (or generated) sources
+// with unbounded `(`/`{`/`class` nesting would otherwise exhaust the C stack
+// and crash the host. Exceeding this is a compile error and the rest of the
+// input is skipped (see abandonInput()), so error recovery, which assumes
+// parsing always makes progress, cannot loop forever.
+#define MAX_NEST_DEPTH 512
+
 // The buffer size used to format a compile error message, excluding the header
 // with the module name and error location. Using a hardcoded buffer for this
 // is kind of hairy, but fortunately we can control what the longest possible
@@ -198,6 +206,11 @@ typedef struct
   // unmatched "(" that are waiting to be closed.
   int parens[MAX_INTERPOLATION_NESTING];
   int numParens;
+
+  // Current depth of nested definitions and expressions (see MAX_NEST_DEPTH).
+  // Incremented on entry to definition() and parsePrecedence(), decremented
+  // on exit.
+  int nestDepth;
 
   // Whether compile errors should be printed to stderr or discarded.
   bool printErrors;
@@ -428,9 +441,14 @@ static void printError(Parser* parser, int line, const char* label,
 
   // Format the label and message.
   char message[ERROR_MESSAGE_SIZE];
-  int length = sprintf(message, "%s: ", label);
-  length += vsprintf(message + length, format, args);
-  ASSERT(length < ERROR_MESSAGE_SIZE, "Error should not exceed buffer.");
+  int length = snprintf(message, ERROR_MESSAGE_SIZE, "%s: ", label);
+  if (length < 0)
+  {
+    length = 0;
+    message[0] = '\0';
+  }
+  if (length > ERROR_MESSAGE_SIZE - 1) length = ERROR_MESSAGE_SIZE - 1;
+  vsnprintf(message + length, ERROR_MESSAGE_SIZE - length, format, args);
 
   ObjString* module = parser->module->name;
   const char* module_name = module ? module->value : "<unknown>";
@@ -481,15 +499,28 @@ static void error(Compiler* compiler, const char* format, ...)
     char label[10 + MAX_VARIABLE_NAME + 4 + 1];
     if (token->length <= MAX_VARIABLE_NAME)
     {
-      sprintf(label, "Error at '%.*s'", token->length, token->start);
+      snprintf(label, sizeof(label), "Error at '%.*s'", token->length,
+               token->start);
     }
     else
     {
-      sprintf(label, "Error at '%.*s...'", MAX_VARIABLE_NAME, token->start);
+      snprintf(label, sizeof(label), "Error at '%.*s...'", MAX_VARIABLE_NAME,
+               token->start);
     }
     printError(compiler->parser, token->line, label, format, args);
   }
   va_end(args);
+}
+
+// Abandons compilation of the rest of the source by fast-forwarding the
+// lexer to the end of the input. Used when the nesting limit (see
+// MAX_NEST_DEPTH) is hit: error recovery would otherwise keep parsing without
+// consuming input and could loop forever. The one or two already-lexed
+// lookahead tokens still drain normally, so every enclosing loop terminates
+// at EOF.
+static void abandonInput(Parser* parser)
+{
+  while (*parser->currentChar != '\0') parser->currentChar++;
 }
 
 // Adds [constant] to the constant pool and returns its index.
@@ -523,6 +554,7 @@ static int addConstant(Compiler* compiler, Value constant)
   {
     error(compiler, "A function may only contain %d unique constants.",
           MAX_CONSTANTS);
+    return -1;
   }
 
   return compiler->fn->constants.count - 1;
@@ -653,7 +685,9 @@ static char peekNextChar(Parser* parser)
 static char nextChar(Parser* parser)
 {
   char c = peekChar(parser);
-  parser->currentChar++;
+  // Do not move the character pointer forward if we're at
+  // the end.
+  if (c != '\0') parser->currentChar++;
   if (c == '\n') parser->currentLine++;
   return c;
 }
@@ -750,7 +784,7 @@ static void makeNumber(Parser* parser, bool isHex)
 
   if (isHex)
   {
-    parser->next.value = NUM_VAL((double)strtoll(parser->tokenStart, NULL, 16));
+    parser->next.value = NUM_VAL((double)strtoull(parser->tokenStart, NULL, 16));
   }
   else
   {
@@ -763,7 +797,7 @@ static void makeNumber(Parser* parser, bool isHex)
     parser->next.value = NUM_VAL(0);
   }
   
-  // We don't check that the entire token is consumed after calling strtoll()
+  // We don't check that the entire token is consumed after calling strtoull()
   // or strtod() because we've already scanned it ourselves and know it's valid.
 
   makeToken(parser, TOKEN_NUMBER);
@@ -847,9 +881,11 @@ static void readName(Parser* parser, TokenType type, char firstChar)
 }
 
 // Reads [digits] hex digits in a string literal and returns their number value.
-static int readHexEscape(Parser* parser, int digits, const char* description)
+static uint32_t readHexEscape(Parser* parser, int digits, const char* description)
 {
-  int value = 0;
+  ASSERT(digits <= 8, "Cannot parse more than 8 digits since the result would overflow.");
+
+  uint32_t value = 0;
   for (int i = 0; i < digits; i++)
   {
     if (peekChar(parser) == '"' || peekChar(parser) == '\0')
@@ -878,7 +914,7 @@ static int readHexEscape(Parser* parser, int digits, const char* description)
 // Reads a hex digit Unicode escape sequence in a string literal.
 static void readUnicodeEscape(Parser* parser, ByteBuffer* string, int length)
 {
-  int value = readHexEscape(parser, length, "Unicode");
+  uint32_t value = readHexEscape(parser, length, "Unicode");
 
   // Grow the buffer enough for the encoded result.
   int numBytes = wrenUtf8EncodeNumBytes(value);
@@ -908,6 +944,20 @@ static void readRawString(Parser* parser)
   for (;;)
   {
     char c = nextChar(parser);
+
+    // If we've reached the end of the source, don't read past it. This check
+    // must happen before any peeks, otherwise nextChar() may have already
+    // advanced the cursor past the terminating '\0'.
+    if (c == '\0')
+    {
+      lexError(parser, "Unterminated raw string.");
+
+      // Don't consume it if it isn't expected. Keeps us from reading past the
+      // end of an unterminated string.
+      parser->currentChar--;
+      break;
+    }
+
     char c1 = peekChar(parser);
     char c2 = peekNextChar(parser);
 
@@ -934,7 +984,7 @@ static void readRawString(Parser* parser)
     // but it's not a newline, so we reset skipStart since we need these characters
     if (firstNewline == -1 && !isWhitespace && c != '\n') skipStart = -1;
 
-    if (c == '\0' || c1 == '\0' || c2 == '\0')
+    if (c1 == '\0' || c2 == '\0')
     {
       lexError(parser, "Unterminated raw string.");
 
@@ -948,8 +998,8 @@ static void readRawString(Parser* parser)
   }
 
   //consume the second and third "
-  nextChar(parser);
-  nextChar(parser);
+  if (peekChar(parser) != '\0') nextChar(parser);
+  if (peekChar(parser) != '\0') nextChar(parser);
 
   int offset = 0;
   int count = string.count;
@@ -1029,8 +1079,19 @@ static void readString(Parser* parser)
           break;
 
         default:
-          lexError(parser, "Invalid escape character '%c'.",
-                   *(parser->currentChar - 1));
+          c = *(parser->currentChar - 1);
+          if (c >= 32 && c <= 126)
+          {
+            lexError(parser, "Invalid escape character '%c'.", c);
+          }
+          else
+          {
+            // Don't show non-ASCII values since we didn't UTF-8 decode the
+            // bytes. Since there are no non-ASCII byte values that are
+            // meaningful escape sequences in Wren, the lexer works on raw
+            // bytes, even though the source code and console output are UTF-8.
+            lexError(parser, "Invalid byte 0x%x in escape sequence.", (uint8_t)c);
+          }
           break;
       }
     }
@@ -1557,6 +1618,12 @@ static int addUpvalue(Compiler* compiler, bool isLocal, int index)
     if (upvalue->index == index && upvalue->isLocal == isLocal) return i;
   }
 
+  if (compiler->fn->numUpvalues == MAX_UPVALUES) {
+    error(compiler, "A function cannot reference more than %d upvalues.",
+          MAX_UPVALUES);
+    return -1;
+  }
+
   // If we got here, it's a new upvalue.
   compiler->upvalues[compiler->fn->numUpvalues].isLocal = isLocal;
   compiler->upvalues[compiler->fn->numUpvalues].index = index;
@@ -1823,15 +1890,33 @@ static void finishBody(Compiler* compiler)
 
 // The VM can only handle a certain number of parameters, so check that we
 // haven't exceeded that and give a usable error.
-static void validateNumParameters(Compiler* compiler, int numArgs)
+static bool validateNumParameters(Compiler* compiler, int numArgs)
 {
+  // Since we always pass arity + 1 (and arity >= 0), numArgs == 0
+  // -> we hit a prior error and don't want to report again.
+  if (numArgs == 0) return false;
   if (numArgs == MAX_PARAMETERS + 1)
   {
     // Only show an error at exactly max + 1 so that we can keep parsing the
     // parameters and minimize cascaded errors.
     error(compiler, "Methods cannot have more than %d parameters.",
           MAX_PARAMETERS);
+    return false;
   }
+
+  return true;
+}
+
+// Returns the CALL_n/SUPER_n opcode that encodes [arity] arguments for the call
+// instruction family starting at [instruction]. The arity is clamped to the
+// encodable range so that, when the parser continues past an arity error, the
+// computed opcode cannot fall outside the CALL_n/SUPER_n range (whose lookup in
+// stackEffects would read out of bounds).
+static Code callOpcode(Code instruction, int arity)
+{
+  if (arity < 0) arity = 0;
+  else if (arity > MAX_PARAMETERS) arity = MAX_PARAMETERS;
+  return (Code)(instruction + arity);
 }
 
 // Parses the rest of a comma-separated parameter list after the opening
@@ -1841,7 +1926,10 @@ static void finishParameterList(Compiler* compiler, Signature* signature)
   do
   {
     ignoreNewlines(compiler);
-    validateNumParameters(compiler, ++signature->arity);
+    if (!validateNumParameters(compiler, ++signature->arity))
+    {
+      signature->arity = -1;
+    }
 
     // Define a local variable in the method for the parameter.
     declareNamedVariable(compiler);
@@ -1967,7 +2055,10 @@ static void finishArgumentList(Compiler* compiler, Signature* signature)
   do
   {
     ignoreNewlines(compiler);
-    validateNumParameters(compiler, ++signature->arity);
+    if (!validateNumParameters(compiler, ++signature->arity))
+    {
+      signature->arity = -1;
+    }
     expression(compiler);
   }
   while (match(compiler, TOKEN_COMMA));
@@ -1981,7 +2072,7 @@ static void callSignature(Compiler* compiler, Code instruction,
                           Signature* signature)
 {
   int symbol = signatureSymbol(compiler, signature);
-  emitShortArg(compiler, (Code)(instruction + signature->arity), symbol);
+  emitShortArg(compiler, callOpcode(instruction, signature->arity), symbol);
 
   if (instruction == CODE_SUPER_0)
   {
@@ -2002,7 +2093,7 @@ static void callMethod(Compiler* compiler, int numArgs, const char* name,
                        int length)
 {
   int symbol = methodSymbol(compiler, name, length);
-  emitShortArg(compiler, (Code)(CODE_CALL_0 + numArgs), symbol);
+  emitShortArg(compiler, callOpcode(CODE_CALL_0, numArgs), symbol);
 }
 
 // Compiles an (optional) argument list for a method call with [methodSignature]
@@ -2525,7 +2616,10 @@ static void subscript(Compiler* compiler, bool canAssign)
     signature.type = SIG_SUBSCRIPT_SETTER;
 
     // Compile the assigned value.
-    validateNumParameters(compiler, ++signature.arity);
+    if (!validateNumParameters(compiler, ++signature.arity))
+    {
+      signature.arity = -1;
+    }
     expression(compiler);
   }
 
@@ -2829,12 +2923,23 @@ static GrammarRule* getRule(TokenType type)
 // The main entrypoint for the top-down operator precedence parser.
 void parsePrecedence(Compiler* compiler, Precedence precedence)
 {
+  // Deeply nested expressions recurse here once per level, so cap the depth
+  // to keep hostile sources from exhausting the C stack (see MAX_NEST_DEPTH).
+  if (compiler->parser->nestDepth >= MAX_NEST_DEPTH)
+  {
+    error(compiler, "Too deeply nested.");
+    abandonInput(compiler->parser);
+    return;
+  }
+  compiler->parser->nestDepth++;
+
   nextToken(compiler->parser);
   GrammarFn prefix = rules[compiler->parser->previous.type].prefix;
 
   if (prefix == NULL)
   {
     error(compiler, "Expected expression.");
+    compiler->parser->nestDepth--;
     return;
   }
 
@@ -2854,6 +2959,8 @@ void parsePrecedence(Compiler* compiler, Precedence precedence)
     GrammarFn infix = rules[compiler->parser->previous.type].infix;
     infix(compiler, canAssign);
   }
+
+  compiler->parser->nestDepth--;
 }
 
 // Parses an expression. Unlike statements, expressions leave a resulting value
@@ -3008,20 +3115,26 @@ static void endLoop(Compiler* compiler)
 
   // Find any break placeholder instructions (which will be CODE_END in the
   // bytecode) and replace them with real jumps.
-  int i = compiler->loop->body;
-  while (i < compiler->fn->code.count)
+  //
+  // If a compilation error occurred, the bytecode may reference constants that
+  // were never added (see addConstant()), so don't scan it.
+  if (!compiler->parser->hasError)
   {
-    if (compiler->fn->code.data[i] == CODE_END)
+    int i = compiler->loop->body;
+    while (i < compiler->fn->code.count)
     {
-      compiler->fn->code.data[i] = CODE_JUMP;
-      patchJump(compiler, i + 1);
-      i += 3;
-    }
-    else
-    {
-      // Skip this instruction and its arguments.
-      i += 1 + getByteCountForArguments(compiler->fn->code.data,
-                               compiler->fn->constants.data, i);
+      if (compiler->fn->code.data[i] == CODE_END)
+      {
+        compiler->fn->code.data[i] = CODE_JUMP;
+        patchJump(compiler, i + 1);
+        i += 3;
+      }
+      else
+      {
+        // Skip this instruction and its arguments.
+        i += 1 + getByteCountForArguments(compiler->fn->code.data,
+                                 compiler->fn->constants.data, i);
+      }
     }
   }
 
@@ -3079,7 +3192,12 @@ static void forStatement(Compiler* compiler)
   // Verify that there is space to hidden local variables.
   // Note that we expect only two addLocal calls next to each other in the
   // following code.
-  if (compiler->numLocals + 2 > MAX_LOCALS)
+  //
+  // The loop variable is also declared with a bare addLocal() below (in its
+  // own nested scope) and is not guarded by declareVariable(), so reserve
+  // space for it here as well. Otherwise a nested for loop near the local
+  // variable limit would write past the end of `locals[MAX_LOCALS]`.
+  if (compiler->numLocals + 3 > MAX_LOCALS)
   {
     error(compiler, "Cannot declare more than %d variables in one scope. (Not enough space for for-loops internal variables)",
           MAX_LOCALS);
@@ -3432,10 +3550,10 @@ static bool matchAttribute(Compiler* compiler) {
 // be parsed.
 static bool method(Compiler* compiler, Variable classVariable)
 {
-  // Parse any attributes before the method and store them
-  if(matchAttribute(compiler)) {
-    return method(compiler, classVariable);
-  }
+  // Parse any attributes before the method and store them. Iterative (not
+  // recursive like the rest of the parser) so a long run of `#...` lines
+  // cannot exhaust the C stack.
+  while (matchAttribute(compiler)) {}
 
   // TODO: What about foreign constructors?
   bool isForeign = match(compiler, TOKEN_FOREIGN);
@@ -3732,20 +3850,32 @@ static void variableDefinition(Compiler* compiler)
 // like the non-curly body of an if or while.
 void definition(Compiler* compiler)
 {
-  if(matchAttribute(compiler)) {
-    definition(compiler);
+  // Leading attributes are iterative: recurse-free so a long run of `#...`
+  // lines cannot exhaust the C stack. matchAttribute() consumes at least the
+  // `#` token when it returns true, so this terminates.
+  while (matchAttribute(compiler)) {}
+
+  // Like parsePrecedence(), blocks, classes and statements nest here once per
+  // level (see MAX_NEST_DEPTH).
+  if (compiler->parser->nestDepth >= MAX_NEST_DEPTH)
+  {
+    error(compiler, "Too deeply nested.");
+    abandonInput(compiler->parser);
     return;
   }
+  compiler->parser->nestDepth++;
 
   if (match(compiler, TOKEN_CLASS))
   {
     classDefinition(compiler, false);
+    compiler->parser->nestDepth--;
     return;
   }
   else if (match(compiler, TOKEN_FOREIGN))
   {
     consume(compiler, TOKEN_CLASS, "Expect 'class' after 'foreign'.");
     classDefinition(compiler, true);
+    compiler->parser->nestDepth--;
     return;
   }
 
@@ -3763,6 +3893,8 @@ void definition(Compiler* compiler)
   {
     statement(compiler);
   }
+
+  compiler->parser->nestDepth--;
 }
 
 ObjFn* wrenCompile(WrenVM* vm, ObjModule* module, const char* source,
@@ -3771,7 +3903,7 @@ ObjFn* wrenCompile(WrenVM* vm, ObjModule* module, const char* source,
   // Skip the UTF-8 BOM if there is one.
   if (strncmp(source, "\xEF\xBB\xBF", 3) == 0) source += 3;
   
-  Parser parser;
+  Parser parser = {};
   parser.vm = vm;
   parser.module = module;
   parser.source = source;
@@ -3780,6 +3912,7 @@ ObjFn* wrenCompile(WrenVM* vm, ObjModule* module, const char* source,
   parser.currentChar = source;
   parser.currentLine = 1;
   parser.numParens = 0;
+  parser.nestDepth = 0;
 
   // Zero-init the current token. This will get copied to previous when
   // nextToken() is called below.
@@ -3968,7 +4101,11 @@ static void addToAttributeGroup(Compiler* compiler,
   if(IS_UNDEFINED(groupMapValue)) 
   {
     groupMapValue = OBJ_VAL(wrenNewMap(vm));
+    // The new map is not reachable yet, so root it across the map set below,
+    // which may trigger a GC.
+    wrenPushRoot(vm, AS_OBJ(groupMapValue));
     wrenMapSet(vm, compiler->attributes, group, groupMapValue);
+    wrenPopRoot(vm);
   }
 
   //we store them as a map per so we can maintain duplicate keys 
@@ -3981,7 +4118,10 @@ static void addToAttributeGroup(Compiler* compiler,
   if(IS_UNDEFINED(keyItemsValue)) 
   {
     keyItemsValue = OBJ_VAL(wrenNewList(vm, 0));
+    // As above, root the fresh list across the allocating map set.
+    wrenPushRoot(vm, AS_OBJ(keyItemsValue));
     wrenMapSet(vm, groupMap, key, keyItemsValue);
+    wrenPopRoot(vm);
   }
 
   //keyItems.add(value)
@@ -4124,17 +4264,20 @@ static void copyMethodAttributes(Compiler* compiler, bool isForeign,
   char fullSignatureWithPrefix[MAX_METHOD_SIGNATURE + 8 + 7];
   const char* foreignPrefix = isForeign ? "foreign " : "";
   const char* staticPrefix = isStatic ? "static " : "";
-  sprintf(fullSignatureWithPrefix, "%s%s%.*s", foreignPrefix, staticPrefix, 
-                                               length, fullSignature);
+  snprintf(fullSignatureWithPrefix, sizeof(fullSignatureWithPrefix), "%s%s%.*s",
+           foreignPrefix, staticPrefix, length, fullSignature);
   fullSignatureWithPrefix[fullLength] = '\0';
 
   if(compiler->enclosingClass->methodAttributes == NULL) {
     compiler->enclosingClass->methodAttributes = wrenNewMap(vm);
   }
   
-  // Store the method attributes in the class map
+  // Store the method attributes in the class map. The key is fresh and not
+  // yet reachable, so root it across the map set, which may trigger a GC.
   Value key = wrenNewStringLength(vm, fullSignatureWithPrefix, fullLength);
+  wrenPushRoot(vm, AS_OBJ(key));
   wrenMapSet(vm, compiler->enclosingClass->methodAttributes, key, OBJ_VAL(methodAttr));
 
-  wrenPopRoot(vm);
+  wrenPopRoot(vm); // key.
+  wrenPopRoot(vm); // methodAttr.
 }

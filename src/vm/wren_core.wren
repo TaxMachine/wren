@@ -6,21 +6,19 @@ class Num {}
 
 class Sequence {
   all(f) {
-    var result = true
     for (element in this) {
-      result = f.call(element)
-      if (!result) return result
+      var result = f.call(element)
+      if (!result) return false
     }
-    return result
+    return true
   }
 
   any(f) {
-    var result = false
     for (element in this) {
-      result = f.call(element)
-      if (result) return result
+      var result = f.call(element)
+      if (result) return true
     }
-    return result
+    return false
   }
 
   contains(element) {
@@ -342,6 +340,13 @@ class List is Sequence {
   }
 
   partition_(low, high, comparer) {
+    // Mid pivot (wren-lang/wren#1141): a `high` pivot degrades to O(n^2)
+    // on sorted/nearly-sorted input. Swap the middle element to `high`
+    // first so the Lomuto scan below partitions around it instead.
+    var mid = ((low + high) / 2).floor
+    var tSwap = this[mid]
+    this[mid] = this[high]
+    this[high] = tSwap
     var p = this[high]
     var i = low - 1
     for (j in low..(high-1)) {
@@ -358,7 +363,13 @@ class List is Sequence {
     return i+1
   }
 
-  toString { "[%(join(", "))]" }
+  // wren-lang/wren#1056: self-referential or deeply nested values recurse
+  // through join/interpolation unbounded. Truncate past the C-side frame
+  // guard (System.printTooDeep_); normal prints never trip it.
+  toString {
+    if (System.printTooDeep_) return "[...]"
+    return "[%(join(", "))]"
+  }
 
   +(other) {
     var result = this[0..-1]
@@ -385,7 +396,9 @@ class Map is Sequence {
   keys { MapKeySequence.new(this) }
   values { MapValueSequence.new(this) }
 
+  // wren-lang/wren#1056: see List.toString above.
   toString {
+    if (System.printTooDeep_) return "{...}"
     var first = true
     var result = "{"
 
@@ -463,6 +476,12 @@ class System {
   }
 
   static writeObject_(obj) {
+    // wren-lang/wren#1056: catch re-entrant prints (a custom toString that
+    // prints) before dispatching; List/Map toString guard the rest.
+    if (printTooDeep_) {
+      writeString_("[...]")
+      return
+    }
     var string = obj.toString
     if (string is String) {
       writeString_(string)
